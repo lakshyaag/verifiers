@@ -13,6 +13,70 @@ from openai import OpenAI
 
 import verifiers as vf
 from verifiers.utils.tool_utils import sanitize_tool_calls
+from verifiers.types import GenerateOutputs
+
+
+def _load_completions_from_path(path: str) -> list:
+    """
+    Load completions from a .jsonl or .json file.
+    - For .jsonl: expects each line to be a JSON object with a "completion" or "text" field,
+      or a raw JSON string representing the completion.
+    - For .json: expects either a list of completions or an object with a "completion" key (list).
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Completions file not found: {path}")
+
+    completions: list = []
+    if p.suffix.lower() == ".jsonl":
+        with p.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, str):
+                        completions.append(obj)
+                    elif isinstance(obj, dict):
+                        if "completion" in obj:
+                            completions.append(obj["completion"])
+                        elif "text" in obj:
+                            completions.append(obj["text"])
+                        else:
+                            raise ValueError(
+                                "JSONL object must have 'completion' or 'text' field, or be a string"
+                            )
+                    else:
+                        raise ValueError(
+                            "JSONL line must be a string or object with 'completion'/'text'"
+                        )
+                except json.JSONDecodeError:
+                    raise ValueError(
+                        "Invalid JSONL: lines must be valid JSON values (string or object)"
+                    )
+    elif p.suffix.lower() == ".json":
+        with p.open("r", encoding="utf-8") as f:
+            obj = json.load(f)
+            if isinstance(obj, list):
+                completions = obj
+            elif isinstance(obj, dict):
+                if "completion" in obj and isinstance(obj["completion"], list):
+                    completions = obj["completion"]
+                elif "completions" in obj and isinstance(obj["completions"], list):
+                    completions = obj["completions"]
+                else:
+                    raise ValueError(
+                        "JSON must be a list of completions or contain 'completion'/'completions' list"
+                    )
+            else:
+                raise ValueError(
+                    "JSON must be a list of completions or an object with 'completion'/'completions' list"
+                )
+    else:
+        raise ValueError("Unsupported completions file type. Use .jsonl or .json")
+
+    return completions
 
 
 def eval_environment(
@@ -32,6 +96,11 @@ def eval_environment(
     save_dataset: bool,
     save_to_hf_hub: bool,
     hf_hub_dataset_name: str,
+    # offline mode args
+    offline: bool = False,
+    use_dataset_completions: bool = False,
+    completions_path: str = "",
+    use_answer_as_completion: bool = False,
 ):
     try:
         endpoints_path_obj = Path(endpoints_path)
@@ -50,8 +119,7 @@ def eval_environment(
             raise ImportError(f"endpoints.py not found at {endpoints_file}")
     except (ImportError, AttributeError):
         print(
-            f"No local endpoint registry found at {endpoints_path}. \
-Please specify the model name (-m), API host base URL (-b), and API key variable name (-k)."
+            f"No local endpoint registry found at {endpoints_path}. \nPlease specify the model name (-m), API host base URL (-b), and API key variable name (-k)."
         )
         ENDPOINTS = {}
 
@@ -60,21 +128,123 @@ Please specify the model name (-m), API host base URL (-b), and API key variable
         api_base_url = ENDPOINTS[model]["url"]
         model = ENDPOINTS[model]["model"]
 
-    client = OpenAI(api_key=os.getenv(api_key_var, "EMPTY"), base_url=api_base_url)
     vf_env = vf.load_environment(env_id=env, **env_args)
-    sampling_args: dict[str, int | float | None] = {
-        "max_tokens": max_tokens,
-    }
-    if temperature is not None:
-        sampling_args["temperature"] = temperature
-    results = vf_env.evaluate(
-        client=client,
-        model=model,
-        sampling_args=sampling_args,
-        num_examples=num_examples,
-        rollouts_per_example=rollouts_per_example,
-        max_concurrent_requests=max_concurrent_requests,
-    )
+
+    # Offline mode: bypass inference, use provided/dataset completions
+    if offline:
+        # Load dataset (eval or train) and apply rollouts_per_example via repeat
+        if vf_env.eval_dataset is None:
+            inputs = vf_env.get_dataset(n=num_examples)
+        else:
+            inputs = vf_env.get_eval_dataset(n=num_examples)
+        assert inputs is not None, "No dataset found"
+        if rollouts_per_example > 1:
+            inputs = inputs.repeat(rollouts_per_example)
+
+        # Extract fields similar to Environment.a_generate pre-processing
+        results_dict: dict = {}
+        for col in inputs.column_names:
+            if col == "info":
+                results_dict[col] = [dict(item) for item in inputs[col]]
+            else:
+                results_dict[col] = list(inputs[col])
+        if "prompt" not in results_dict:
+            raise ValueError("prompt column not found in inputs for offline evaluation")
+        if "answer" not in results_dict and "info" not in results_dict:
+            # allow empty answers if not provided
+            results_dict["answer"] = [""] * len(results_dict["prompt"])
+        if "answer" not in results_dict:
+            results_dict["answer"] = [""] * len(results_dict["prompt"])
+        if "task" not in results_dict:
+            results_dict["task"] = ["default"] * len(results_dict["prompt"])
+        if "info" not in results_dict:
+            results_dict["info"] = [{}] * len(results_dict["prompt"])
+
+        # Determine completions source
+        completions: list = []
+        if use_answer_as_completion:
+            completions = list(results_dict["answer"])  # type: ignore
+        elif use_dataset_completions and "completion" in results_dict:
+            completions = list(results_dict["completion"])  # type: ignore
+        elif completions_path:
+            completions = _load_completions_from_path(completions_path)
+        elif "completion" in results_dict:
+            # if dataset already has completions, default to using them
+            completions = list(results_dict["completion"])  # type: ignore
+        else:
+            raise ValueError(
+                "Offline mode requires completions. Provide --use-dataset-completions if dataset contains a 'completion' column, --completions-path to a JSON/JSONL with completions, or --use-answer-as-completion."
+            )
+
+        if len(completions) != len(results_dict["prompt"]):
+            raise ValueError(
+                f"Number of completions ({len(completions)}) does not match number of prompts ({len(results_dict['prompt'])})."
+            )
+
+        # Sanitize completions for tool calls if necessary during save
+        # Build states as empty dicts
+        states = [{} for _ in completions]
+
+        # Score offline rollouts
+        rollout_scores = vf_env.rubric.score_rollouts(
+            prompts=results_dict["prompt"],
+            completions=completions,
+            answers=results_dict["answer"],
+            states=states,
+            tasks=results_dict["task"],
+            infos=results_dict["info"],
+        )
+        # score_rollouts may be async or return a coroutine depending on rubric; handle both
+        if hasattr(rollout_scores, "__await__"):
+            # run in a minimal event loop via Environment.generate helper
+            # Reuse Environment.a_generate run loop pattern by creating a temporary GenerateOutputs via coroutine
+            from asyncio import get_running_loop, new_event_loop, set_event_loop
+            from concurrent.futures import ThreadPoolExecutor
+
+            try:
+                loop = get_running_loop()
+                import nest_asyncio  # type: ignore
+
+                nest_asyncio.apply()
+                rollout_scores = loop.run_until_complete(rollout_scores)  # type: ignore
+            except RuntimeError:
+                executor = ThreadPoolExecutor(max_workers=vf_env.max_workers)
+                loop = new_event_loop()
+                try:
+                    loop.set_default_executor(executor)
+                    set_event_loop(loop)
+                    rollout_scores = loop.run_until_complete(rollout_scores)  # type: ignore
+                finally:
+                    loop.close()
+                    set_event_loop(None)
+                    executor.shutdown(wait=False)
+
+        results = GenerateOutputs(
+            prompt=list(results_dict["prompt"]),
+            completion=list(completions),
+            answer=list(results_dict["answer"]),
+            state=states,
+            info=list(results_dict["info"]),
+            task=list(results_dict["task"]),
+            reward=list(rollout_scores.reward),  # type: ignore
+            metrics=dict(rollout_scores.metrics),  # type: ignore
+        )
+    else:
+        client = OpenAI(api_key=os.getenv(api_key_var, "EMPTY"), base_url=api_base_url)
+        sampling_args: dict[str, int | float | None] = {
+            "max_tokens": max_tokens,
+        }
+        if temperature is not None:
+            sampling_args["temperature"] = temperature
+        results = vf_env.evaluate(
+            client=client,
+            model=model,
+            sampling_args=sampling_args,
+            num_examples=num_examples,
+            rollouts_per_example=rollouts_per_example,
+            max_concurrent_requests=max_concurrent_requests,
+        )
+
     print("--- Evaluation ---")
     print(f"Environment: {env}")
     print(f"Model: {model}")
@@ -91,8 +261,6 @@ Please specify the model name (-m), API host base URL (-b), and API key variable
     print(
         f"reward: avg - {sum(results.reward) / len(results.reward):.3f}, std - {np.std(results.reward):.3f}"
     )
-    n = num_examples
-    r = rollouts_per_example
     if verbose:
         for i in range(len(results.prompt)):
             print(f"Prompt: {results.prompt[i]}")
@@ -101,8 +269,12 @@ Please specify the model name (-m), API host base URL (-b), and API key variable
             print(f"Answer: {results.answer[i]}")
             print(f"Info: {results.info[i]}")
             print(f"Task: {results.task[i]}")
+    n = num_examples
+    r = rollouts_per_example
     if n < 0:
         n = len(results.reward) // r
+    if r <= 0:
+        r = 1
     for i in range(r):
         # rounded to 3 decimal places
         trials = [round(results.reward[(i * n) + j], 3) for j in range(n)]
@@ -118,10 +290,9 @@ Please specify the model name (-m), API host base URL (-b), and API key variable
             print(out)
 
     if save_dataset or save_to_hf_hub:
-        ids = [
-            i // rollouts_per_example
-            for i in range(num_examples * rollouts_per_example)
-        ]
+        # Determine effective number of examples
+        effective_n = len(results.reward) // rollouts_per_example if rollouts_per_example > 0 else len(results.reward)
+        ids = [i // rollouts_per_example for i in range(effective_n * rollouts_per_example)] if rollouts_per_example > 0 else list(range(len(results.reward)))
         prompts = results.prompt
         completions = []
         for c in results.completion:
@@ -148,7 +319,7 @@ Please specify the model name (-m), API host base URL (-b), and API key variable
         metadata = {
             "env": env,
             "model": model,
-            "num_examples": num_examples,
+            "num_examples": effective_n,
             "rollouts_per_example": rollouts_per_example,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -179,7 +350,7 @@ Please specify the model name (-m), API host base URL (-b), and API key variable
         if save_to_hf_hub:
             if hf_hub_dataset_name == "":
                 dataset_name = (
-                    f"{env}_{model}_n={num_examples}_r={rollouts_per_example}"
+                    f"{env}_{model}_n={effective_n}_r={rollouts_per_example}"
                 )
             else:
                 dataset_name = hf_hub_dataset_name
@@ -197,7 +368,7 @@ def main():
         "-a",
         type=json.loads,
         default={},
-        help='Environment module arguments as JSON object (e.g., \'{"key": "value", "num": 42}\')',
+        help="Environment module arguments as JSON object (e.g., '{\"key\": \"value\", \"num\": 42}')",
     )
     parser.add_argument(
         "--env-dir-path",
@@ -289,6 +460,39 @@ def main():
         default="",
         help="Name of dataset to save to Hugging Face Hub",
     )
+    # Offline options
+    parser.add_argument(
+        "--offline",
+        "-O",
+        default=False,
+        action="store_true",
+        help=(
+            "Offline evaluation: skip inference and score provided completions or answers. "
+            "Use --use-dataset-completions if your dataset has a 'completion' column, "
+            "--completions-path to provide an external list, or --use-answer-as-completion."
+        ),
+    )
+    parser.add_argument(
+        "--use-dataset-completions",
+        "-C",
+        default=False,
+        action="store_true",
+        help="Use the 'completion' column from the environment dataset (if present)",
+    )
+    parser.add_argument(
+        "--completions-path",
+        "-f",
+        type=str,
+        default="",
+        help="Path to a .jsonl/.json file containing completions",
+    )
+    parser.add_argument(
+        "--use-answer-as-completion",
+        "-A",
+        default=False,
+        action="store_true",
+        help="Use dataset 'answer' as completion (idealized ground truth)",
+    )
     args = parser.parse_args()
 
     eval_environment(
@@ -308,6 +512,10 @@ def main():
         save_dataset=args.save_dataset,
         save_to_hf_hub=args.save_to_hf_hub,
         hf_hub_dataset_name=args.hf_hub_dataset_name,
+        offline=args.offline,
+        use_dataset_completions=args.use_dataset_completions,
+        completions_path=args.completions_path,
+        use_answer_as_completion=args.use_answer_as_completion,
     )
 
 
