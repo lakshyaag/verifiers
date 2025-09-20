@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, Mock
 
+from pydantic import BaseModel
 import pytest
 from datasets import Dataset
 
@@ -216,10 +217,19 @@ class TestEnvironmentBase:
                 "function": {
                     "name": "calculator",
                     "description": "calc",
-                    "parameters": {"type": "object", "properties": {}},
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                        },
+                    },
                 },
             }
         ]
+
+        class CalculatorResponse(BaseModel):
+            answer: int
 
         response = await env.get_model_response(
             prompt=prompt,
@@ -227,7 +237,7 @@ class TestEnvironmentBase:
             model="test-model",
             message_type="chat",
             oai_tools=tools,
-            sampling_args={"response_format": object},
+            sampling_args={"response_format": CalculatorResponse},
         )
 
         assert hasattr(response, "choices")

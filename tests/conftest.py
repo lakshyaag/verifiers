@@ -151,21 +151,23 @@ class MockAsyncOpenAI:
             response_data = self.chat_completions[key]
         else:
             response_data = {
-                "content": self.default_chat_response,
+                "parsed": self.default_chat_response,
                 "finish_reason": "stop",
                 "tool_calls": None,
             }
 
         # Create mock response with .parsed on message
-        from openai.types.chat.chat_completion import ChatCompletion, Choice
-        from openai.types.chat.chat_completion_message import ChatCompletionMessage
+        from openai.types.chat.parsed_chat_completion import (
+            ParsedChatCompletion,
+            ParsedChoice,
+            ParsedChatCompletionMessage,
+        )
 
-        mock_response = MagicMock(spec=ChatCompletion)
-        mock_choice = MagicMock(spec=Choice)
-        mock_message = MagicMock(spec=ChatCompletionMessage)
+        mock_response = MagicMock(spec=ParsedChatCompletion)
+        mock_choice = MagicMock(spec=ParsedChoice)
+        mock_message = MagicMock(spec=ParsedChatCompletionMessage)
 
-        mock_message.content = response_data["content"]
-        mock_message.parsed = response_data["content"]
+        mock_message.parsed = response_data["parsed"]
         mock_message.role = "assistant"
         mock_message.tool_calls = response_data.get("tool_calls", None)
         mock_choice.message = mock_message
@@ -175,7 +177,7 @@ class MockAsyncOpenAI:
         mock_response.choices = [mock_choice]
         mock_response.id = "test-id"
         mock_response.model = "test-model"
-        mock_response.object = "chat.completion"
+        mock_response.object = "chat.completion.parsed"
 
         return mock_response
 
