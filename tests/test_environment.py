@@ -197,6 +197,47 @@ class TestEnvironmentBase:
         mock_openai_client.chat.completions.create.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_get_model_response_chat_with_response_format_and_tools(
+        self, mock_openai_client
+    ):
+        """Test get_model_response uses parse when response_format is provided and forwards tools."""
+        env = SimpleEnvironment(
+            client=mock_openai_client,
+            model="test-model",
+            eval_dataset=Dataset.from_dict({"question": ["test"], "answer": ["test"]}),
+            parser=Parser(),
+            rubric=Rubric(),
+        )
+
+        prompt = [{"role": "user", "content": "Hello"}]
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "description": "calc",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ]
+
+        response = await env.get_model_response(
+            prompt=prompt,
+            client=mock_openai_client,
+            model="test-model",
+            message_type="chat",
+            oai_tools=tools,
+            sampling_args={"response_format": object},
+        )
+
+        assert hasattr(response, "choices")
+        # parse should be called instead of create
+        assert mock_openai_client.chat.completions.parse.await_count == 1
+        # tools should have been forwarded
+        called_kwargs = mock_openai_client.chat.completions.parse.call_args.kwargs
+        assert "tools" in called_kwargs and called_kwargs["tools"] == tools
+
+    @pytest.mark.asyncio
     async def test_get_model_response_completion(self, mock_openai_client):
         """Test get_model_response with completion format."""
         env = SimpleEnvironment(

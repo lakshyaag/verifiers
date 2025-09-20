@@ -75,6 +75,9 @@ class MockAsyncOpenAI:
         self.chat.completions.create = AsyncMock(
             side_effect=self._handle_chat_completion
         )
+        self.chat.completions.parse = AsyncMock(
+            side_effect=self._handle_chat_completion_parse
+        )
         self.completions.create = AsyncMock(side_effect=self._handle_text_completion)
 
     def add_chat_response(
@@ -127,6 +130,42 @@ class MockAsyncOpenAI:
 
         # Set the attributes
         mock_message.content = response_data["content"]
+        mock_message.role = "assistant"
+        mock_message.tool_calls = response_data.get("tool_calls", None)
+        mock_choice.message = mock_message
+        mock_choice.finish_reason = response_data["finish_reason"]
+        mock_choice.index = 0
+
+        mock_response.choices = [mock_choice]
+        mock_response.id = "test-id"
+        mock_response.model = "test-model"
+        mock_response.object = "chat.completion"
+
+        return mock_response
+
+    async def _handle_chat_completion_parse(self, messages, **kwargs):
+        """Handle chat completion parse requests (structured outputs)."""
+        key = self._messages_to_key(messages)
+
+        if key in self.chat_completions:
+            response_data = self.chat_completions[key]
+        else:
+            response_data = {
+                "content": self.default_chat_response,
+                "finish_reason": "stop",
+                "tool_calls": None,
+            }
+
+        # Create mock response with .parsed on message
+        from openai.types.chat.chat_completion import ChatCompletion, Choice
+        from openai.types.chat.chat_completion_message import ChatCompletionMessage
+
+        mock_response = MagicMock(spec=ChatCompletion)
+        mock_choice = MagicMock(spec=Choice)
+        mock_message = MagicMock(spec=ChatCompletionMessage)
+
+        mock_message.content = response_data["content"]
+        mock_message.parsed = response_data["content"]
         mock_message.role = "assistant"
         mock_message.tool_calls = response_data.get("tool_calls", None)
         mock_choice.message = mock_message
